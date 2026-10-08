@@ -4,7 +4,7 @@
 
 **Interfaz en Streamlit para convertir las conversaciones de una comunidad tech en contenido listo para publicar.**
 
-Carga un lote de mensajes, muestra la salud de la comunidad, permite al equipo aprobar los posts, casos de éxito y FAQs generados, y deriva a tickets lo que el bot no puede resolver solo. Funciona sola, sin API key ni nube.
+Carga un lote de mensajes, muestra la salud de la comunidad, permite al equipo aprobar los posts, casos de éxito y FAQs generados, y deriva a tickets lo que el bot no puede resolver solo. Funciona sola, sin API key ni nube, con acceso por contraseña y tema claro u oscuro.
 
 ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)
 ![Streamlit](https://img.shields.io/badge/Streamlit-1.50+-FF4B4B?logo=streamlit&logoColor=white)
@@ -61,6 +61,36 @@ Cuando el equipo resuelve una duda técnica, la respuesta pasa automáticamente 
 | **Ranking y alertas** | **Paquete** |
 | <img src="docs/img/03-ranking.png" alt="Ranking"> | <img src="docs/img/06-paquete.png" alt="Paquete"> |
 
+## 🔐 Acceso con contraseña
+
+La app no muestra nada hasta ingresar la contraseña del equipo.
+
+| | |
+|---|---|
+| <img src="docs/img/08-ingreso.png" alt="Pantalla de ingreso"> | - Se compara el **hash SHA-256** en tiempo constante; la contraseña nunca queda en la sesión.<br>- **5 intentos** fallidos bloquean el ingreso por 30 segundos.<br>- La sesión se cierra tras **60 minutos** sin actividad (configurable).<br>- Botón **Cerrar sesión** en la barra lateral. |
+
+**Configurar tu contraseña:** copia `.streamlit/secrets.toml.example` como `.streamlit/secrets.toml` (ya está en `.gitignore`) y pon el hash:
+
+```bat
+python -c "import hashlib; print(hashlib.sha256('mi-clave-segura'.encode()).hexdigest())"
+```
+
+```toml
+[auth]
+password_sha256 = "el-hash-que-generaste"
+minutos_sesion = 60
+```
+
+También acepta las variables de entorno `COMMUNITYLAB_PASSWORD_SHA256` o `COMMUNITYLAB_PASSWORD`. Si no configuras ninguna, la app usa la contraseña de demostración **`communitylab`** y lo avisa en la pantalla de ingreso.
+
+> Al desplegar en Streamlit Community Cloud, pega el bloque `[auth]` en **Settings → Secrets** de la app.
+
+## 🌗 Modo oscuro
+
+La app trae una paleta clara y otra oscura con los colores de la marca (`.streamlit/config.toml`). Por defecto sigue el tema del sistema; cada persona puede elegir **Claro / Oscuro** desde el menú **⋮ → Settings**, y Streamlit recuerda su elección.
+
+<img src="docs/img/09-modo-oscuro.png" alt="CommunityLab en modo oscuro" width="85%">
+
 ## ⚡ Cómo ejecutarlo
 
 ```bat
@@ -73,7 +103,7 @@ python -m venv .venv
 
 > En macOS / Linux: `source .venv/bin/activate` y luego `streamlit run app.py`.
 
-Pulsa **Cargar lote de ejemplo** → **Procesar lote** y recorre las pestañas.
+Ingresa con tu contraseña (o `communitylab` si aún no configuraste una), pulsa **Cargar lote de ejemplo** → **Procesar lote** y recorre las pestañas.
 
 ### Formato de entrada
 
@@ -107,16 +137,18 @@ JSON con el formato del reto, o CSV con las columnas `autor, canal, tipo, texto`
 .venv\Scripts\python.exe -m pytest tests -q
 ```
 
-**12 pruebas** con **Streamlit AppTest**: el flujo completo (cargar, procesar, aprobar, editar y guardar), la creación de tickets, que resolver exija una respuesta y la envíe al FAQ, los tickets manuales, y que el panel de control guarde, valide, restablezca y reprocese. Se ejecutan en cada push con GitHub Actions.
+**18 pruebas** con **Streamlit AppTest**: el flujo completo (cargar, procesar, aprobar, editar y guardar), la creación de tickets, que resolver exija una respuesta y la envíe al FAQ, los tickets manuales, que el panel de control guarde, valide, restablezca y reprocese, y el acceso: nada visible sin contraseña, contraseña incorrecta, bloqueo por intentos, ingreso por hash, aviso de contraseña de demostración y cierre de sesión. Se ejecutan en cada push con GitHub Actions.
 
 ## 📁 Estructura
 
 ```text
 app.py                  interfaz Streamlit (6 pestañas)
+acceso.py               pantalla de ingreso con contraseña, bloqueo y expiración de sesión
 motor_demo.py           motor de demostración: heurísticas, ruteo, plantillas, tickets y paquete
 data/                   lote de ejemplo del reto (9 mensajes)
-tests/test_app.py       12 pruebas de interfaz y del motor
-.streamlit/config.toml  tema de la app
+tests/test_app.py       18 pruebas de interfaz, motor y acceso
+.streamlit/config.toml  temas claro y oscuro
+.streamlit/secrets.toml.example  plantilla para la contraseña
 docs/img/               capturas
 ```
 
