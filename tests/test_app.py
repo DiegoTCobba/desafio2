@@ -130,9 +130,10 @@ def test_panel_cambia_reglas_y_reprocesa(app):
     exitos_antes = sum(a["ruta"] == "caso_exito" for a in app.session_state.resultado["analisis"])
     assert exitos_antes > 0
 
-    app.slider(key="cfg_umbral_exito_0").set_value(1.0).run()
-    app.number_input(key="cfg_max_por_ruta_0").set_value(5).run()
-    app.text_area(key="cfg_equipo_0").input("Ana\nLuis").run()
+    # Un formulario envía todos sus campos juntos: se completan y luego se pulsa el botón, sin reruns intermedios.
+    app.slider(key="cfg_umbral_exito_0").set_value(1.0)
+    app.number_input(key="cfg_max_por_ruta_0").set_value(5)
+    app.text_area(key="cfg_equipo_0").input("Ana\nLuis")
     boton(app, "Guardar configuración").click().run()
     cfg = app.session_state.config
     assert cfg["umbral_exito"] == 1.0 and cfg["max_por_ruta"] == 5 and cfg["equipo"] == ["Ana", "Luis"]
@@ -144,7 +145,7 @@ def test_panel_cambia_reglas_y_reprocesa(app):
 
 
 def test_panel_restablece_valores(app):
-    app.slider(key="cfg_umbral_exito_0").set_value(0.9).run()
+    app.slider(key="cfg_umbral_exito_0").set_value(0.9)
     boton(app, "Guardar configuración").click().run()
     assert app.session_state.config["umbral_exito"] == 0.9
     boton(app, "Restablecer valores por defecto").click().run()
@@ -152,7 +153,7 @@ def test_panel_restablece_valores(app):
 
 
 def test_panel_rechaza_equipo_vacio(app):
-    app.text_area(key="cfg_equipo_0").input("   ").run()
+    app.text_area(key="cfg_equipo_0").input("   ")
     boton(app, "Guardar configuración").click().run()
     assert app.session_state.config["equipo"]
 
