@@ -1,11 +1,13 @@
 """CommunityLab · Interfaz Streamlit (frontend independiente)
-Ingesta → Salud de la comunidad → Curaduría/aprobación → Paquete descargable.
+Ingesta → Salud → Curaduría → Tickets → Paquete, más un panel de control para ajustar el sistema.
 Funciona sola con el motor de demostración (motor_demo.py): sin API key ni nube.
 
 Ejecutar:  streamlit run app.py
 """
+import copy
 import io
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import altair as alt
@@ -21,6 +23,24 @@ TIPOS_ENTRADA = ["testimonio", "entrega_proyecto", "pregunta_tecnica", "feedback
 COLOR_SENT = {"Altamente Positivo": "#1a9850", "Positivo": "#91cf60", "Neutral": "#b8b8b8",
               "Negativo": "#fc8d59", "Altamente Negativo": "#d73027"}
 ICONO_ESTADO = {"pendiente": "🕓 Pendiente", "aprobado": "✅ Aprobado", "rechazado": "⛔ Rechazado"}
+ICONO_PRIORIDAD = {"Alta": "🔴 Alta", "Media": "🟠 Media", "Baja": "🟢 Baja"}
+ICONO_TICKET = {"Pendiente": "🕓 Pendiente", "En progreso": "🔧 En progreso", "Escalado": "⬆️ Escalado",
+                "Resuelto": "✅ Resuelto"}
+SIN_ASIGNAR = "Sin asignar"
+CONFIG_DEFAULT = {
+    "voz": pl.VOZ_MARCA_DEFAULT,
+    "umbral_exito": 0.4,
+    "umbral_alerta": -0.4,
+    "max_por_ruta": 3,
+    "palabras_alerta": list(pl.PALABRAS_ALERTA_DEFAULT),
+    "hashtags_base": list(pl.HASHTAGS_BASE_DEFAULT),
+    "limite_x": 280,
+    "equipo": ["Mentoría técnica", "Community Manager", "Equipo académico"],
+    "sla": dict(pl.SLA_DEFAULT),
+    "tickets_alertas": True,
+    "tickets_derivadas": True,
+    "tickets_excedentes": True,
+}
 
 st.set_page_config(page_title="CommunityLab", page_icon="🚀", layout="wide")
 
@@ -44,7 +64,8 @@ st.markdown("""
 def init_state():
     defaults = {"df": None, "df_ver": 0, "origen": "Discord_Grupo_ONE_G10", "periodo": "Semana_04",
                 "resultado": None, "activos": [], "guardado": None, "msg_ingesta": None,
-                "listado": None}
+                "listado": None, "tickets": [], "ultimo_payload": None, "msg_ticket": None,
+                "msg_panel": None, "cfg_ver": 0, "config": copy.deepcopy(CONFIG_DEFAULT)}
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
 
@@ -96,11 +117,6 @@ def cargar_pegado():
         st.session_state.msg_ingesta = ("error", f"JSON inválido: {e}")
 
 
-def _limpiar_widgets_activos():
-    for k in [k for k in st.session_state if str(k).startswith(("txt_", "tit_"))]:
-        del st.session_state[k]
-
-
 def buscar(aid):
     return next(a for a in st.session_state.activos if a["id"] == aid)
 
@@ -127,6 +143,172 @@ def reiniciar_curaduria():
         a["estado"] = "pendiente"
 
 
+# ------------------------------------------------------------ procesamiento
+def crear_motor():
+    c = st.session_state.config
+    return pl.MotorCommunityLab(voz_marca=c["voz"], umbral_exito=c["umbral_exito"], max_por_ruta=c["max_por_ruta"],
+                                umbral_alerta=c["umbral_alerta"], palabras_alerta=c["palabras_alerta"],
+                                hashtags_base=c["hashtags_base"])
+
+
+def aplicar_resultado(resultado, payload):
+    c = st.session_state.config
+    for k in [k for k in st.session_state if str(k).startswith(("txt_", "tit_", "tk_"))]:
+        del st.session_state[k]
+    st.session_state.resultado = resultado
+    st.session_state.activos = resultado["activos"]
+    st.session_state.tickets = pl.generar_tickets(
+        resultado, resultado["activos"], sla=c["sla"], incluir_alertas=c["tickets_alertas"],
+        incluir_derivadas=c["tickets_derivadas"], incluir_excedentes=c["tickets_excedentes"])
+    st.session_state.ultimo_payload = payload
+    st.session_state.guardado = None
+    st.session_state.listado = None
+
+
+# ------------------------------------------------------------ tickets
+def buscar_ticket(tid):
+    return next(t for t in st.session_state.tickets if t["id"] == tid)
+
+
+def _leer_widgets_ticket(t):
+    asignado = st.session_state.get(f"tk_asig_{t['id']}", t["asignado_a"] or SIN_ASIGNAR)
+    return ("" if asignado == SIN_ASIGNAR else asignado), st.session_state.get(f"tk_resp_{t['id']}", t["respuesta"])
+
+
+def guardar_ticket(tid):
+    t = buscar_ticket(tid)
+    asignado, respuesta = _leer_widgets_ticket(t)
+    estado = st.session_state.get(f"tk_est_{tid}", t["estado"])
+    if estado == "Resuelto" and not respuesta.strip():
+        st.session_state.msg_ticket = ("warning", f"{tid}: escribe una respuesta antes de marcarlo como resuelto.")
+        st.session_state[f"tk_est_{tid}"] = t["estado"]
+        return
+    if estado == "Pendiente" and asignado and t["estado"] == "Pendiente":
+        estado = "En progreso"
+    pl.actualizar_ticket(t, estado=estado, asignado_a=asignado, respuesta=respuesta)
+    st.session_state[f"tk_est_{tid}"] = t["estado"]
+    st.session_state.msg_ticket = ("success", f"{tid} actualizado.")
+
+
+def resolver_ticket(tid):
+    t = buscar_ticket(tid)
+    asignado, respuesta = _leer_widgets_ticket(t)
+    if not respuesta.strip():
+        st.session_state.msg_ticket = ("warning", f"{tid}: escribe una respuesta antes de resolverlo.")
+        return
+    pl.actualizar_ticket(t, estado="Resuelto", asignado_a=asignado, respuesta=respuesta)
+    st.session_state[f"tk_est_{tid}"] = "Resuelto"
+    msg = f"{tid} resuelto."
+    if t["activo_id"] and st.session_state.get(f"tk_faq_{tid}", True):
+        activo = buscar(t["activo_id"])
+        pl.respuesta_a_faq(activo, respuesta.strip())
+        st.session_state.pop(f"txt_{activo['id']}", None)
+        t["historial"].append(f"{datetime.now():%H:%M} · respuesta enviada al FAQ para curaduría")
+        msg += " La respuesta pasó al borrador del FAQ en Curaduría."
+    st.session_state.msg_ticket = ("success", msg)
+
+
+def escalar_ticket(tid):
+    t = buscar_ticket(tid)
+    asignado, respuesta = _leer_widgets_ticket(t)
+    pl.actualizar_ticket(t, estado="Escalado", asignado_a=asignado, respuesta=respuesta)
+    st.session_state[f"tk_est_{tid}"] = "Escalado"
+    st.session_state.msg_ticket = ("info", f"{tid} escalado.")
+
+
+def reabrir_ticket(tid):
+    t = buscar_ticket(tid)
+    pl.actualizar_ticket(t, estado="En progreso" if t["asignado_a"] else "Pendiente")
+    st.session_state[f"tk_est_{tid}"] = t["estado"]
+
+
+def crear_ticket_manual():
+    autor = st.session_state.get("nt_autor", "").strip()
+    mensaje = st.session_state.get("nt_mensaje", "").strip()
+    if not autor or not mensaje:
+        st.session_state.msg_ticket = ("warning", "Completa al menos el autor y el mensaje del ticket.")
+        return
+    prioridad = st.session_state.get("nt_prioridad", "Media")
+    ahora = datetime.now().replace(microsecond=0)
+    sla = st.session_state.config["sla"]
+    nuevo = {
+        "id": f"TCK-{len(st.session_state.tickets) + 1:03d}", "relevancia": 0, "interaccion_id": None,
+        "activo_id": None, "tipo": st.session_state.get("nt_tipo", "Duda técnica"), "motivo": "Creado manualmente",
+        "prioridad": prioridad, "estado": "Pendiente", "autor": autor,
+        "canal": st.session_state.get("nt_canal", "").strip() or "#general", "mensaje": mensaje, "temas": [],
+        "asignado_a": "", "respuesta": "", "creado_en": ahora.isoformat(),
+        "vence_en": (ahora + timedelta(hours=sla[prioridad])).isoformat(), "resuelto_en": None,
+        "historial": [f"{ahora:%H:%M} · creado manualmente"],
+    }
+    st.session_state.tickets.append(nuevo)
+    for k in ("nt_autor", "nt_canal", "nt_mensaje"):
+        st.session_state[k] = ""
+    st.session_state.msg_ticket = ("success", f"{nuevo['id']} creado.")
+
+
+# ------------------------------------------------------------ panel de control
+def _lista(texto, sep=","):
+    return [x.strip() for x in texto.replace("\n", sep).split(sep) if x.strip()]
+
+
+def guardar_config():
+    v = st.session_state.cfg_ver
+    g = lambda k: st.session_state[f"cfg_{k}_{v}"]  # noqa: E731
+    equipo = _lista(g("equipo"), "\n")
+    if not equipo:
+        st.session_state.msg_panel = ("warning", "El equipo de soporte necesita al menos una persona o área.")
+        return
+    st.session_state.config = {
+        "voz": g("voz").strip() or pl.VOZ_MARCA_DEFAULT,
+        "umbral_exito": g("umbral_exito"), "umbral_alerta": g("umbral_alerta"), "max_por_ruta": int(g("max_por_ruta")),
+        "palabras_alerta": _lista(g("palabras_alerta")) or list(pl.PALABRAS_ALERTA_DEFAULT),
+        "hashtags_base": [h if h.startswith("#") else f"#{h}" for h in _lista(g("hashtags_base").replace(" ", ","))],
+        "limite_x": int(g("limite_x")), "equipo": equipo,
+        "sla": {"Alta": int(g("sla_alta")), "Media": int(g("sla_media")), "Baja": int(g("sla_baja"))},
+        "tickets_alertas": g("tk_alertas"), "tickets_derivadas": g("tk_derivadas"), "tickets_excedentes": g("tk_excedentes"),
+    }
+    st.session_state.msg_panel = ("success", "Configuración guardada. Se aplica en el próximo procesamiento.")
+
+
+def restablecer_config():
+    st.session_state.config = copy.deepcopy(CONFIG_DEFAULT)
+    st.session_state.cfg_ver += 1
+    st.session_state.msg_panel = ("info", "Se restablecieron los valores por defecto.")
+
+
+def importar_config(archivo):
+    if archivo is None:
+        st.session_state.msg_panel = ("warning", "Primero selecciona un archivo de configuración.")
+        return
+    try:
+        datos = json.loads(archivo.getvalue().decode("utf-8"))
+        desconocidas = set(datos) - set(CONFIG_DEFAULT)
+        if desconocidas:
+            raise ValueError(f"claves desconocidas: {', '.join(sorted(desconocidas))}")
+        nueva = copy.deepcopy(CONFIG_DEFAULT)
+        nueva.update(datos)
+        st.session_state.config = nueva
+        st.session_state.cfg_ver += 1
+        st.session_state.msg_panel = ("success", "Configuración importada.")
+    except Exception as e:  # noqa: BLE001
+        st.session_state.msg_panel = ("error", f"No se pudo importar: {e}")
+
+
+def reprocesar():
+    payload = st.session_state.ultimo_payload
+    if payload:
+        aplicar_resultado(crear_motor().procesar(payload), payload)
+        st.session_state.msg_panel = ("success", "Lote reprocesado con la configuración actual.")
+
+
+def limpiar_sesion():
+    cfg, ver = st.session_state.config, st.session_state.cfg_ver
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+    st.session_state.config, st.session_state.cfg_ver = cfg, ver
+    st.session_state.msg_panel = ("info", "Sesión limpia. La configuración se conservó.")
+
+
 init_state()
 
 # ============================================================ barra lateral
@@ -137,11 +319,16 @@ with st.sidebar:
     st.info("**Modo demostración.** El análisis usa heurísticas y plantillas, sin API key ni nube. "
             "El motor con Gemini y OCI vive en el repo [desafio](https://github.com/DiegoTCobba/desafio).")
 
-    st.subheader("🎯 Voz de marca y ruteo")
-    voz = st.text_area("Voz de marca", value=pl.VOZ_MARCA_DEFAULT, height=160)
-    umbral = st.slider("Sentimiento mínimo para Caso de Éxito", 0.0, 1.0, 0.4, 0.05,
-                       help="Testimonios/proyectos por encima de este puntaje se convierten en casos de éxito.")
-    max_por_ruta = st.number_input("Máx. interacciones a transformar por ruta", 1, 10, 3)
+    cfg = st.session_state.config
+    st.subheader("⚙️ Configuración activa")
+    st.markdown(f"- Caso de éxito si sentimiento ≥ **{cfg['umbral_exito']:+.2f}**\n"
+                f"- Alerta si sentimiento ≤ **{cfg['umbral_alerta']:+.2f}**\n"
+                f"- Hasta **{cfg['max_por_ruta']}** mensajes por ruta\n"
+                f"- Equipo de soporte: **{len(cfg['equipo'])}**")
+    st.caption("Cámbiala en la pestaña **⚙️ Panel de control**.")
+    abiertos = sum(t["estado"] != "Resuelto" for t in st.session_state.tickets)
+    if abiertos:
+        st.warning(f"🎫 {abiertos} ticket(s) abierto(s)")
 
 
 def almacen_activo():
@@ -156,10 +343,11 @@ st.markdown("""<div class="hero"><h1>🚀 CommunityLab</h1>
 res = st.session_state.resultado
 activos = st.session_state.activos
 n_aprob = sum(a["estado"] == "aprobado" for a in activos)
-tab_in, tab_salud, tab_cur, tab_pkg = st.tabs([
-    "📥 1 · Ingesta", "📊 2 · Salud de la comunidad",
-    "✍️ 3 · Curaduría",  # etiqueta fija: si cambia, Streamlit vuelve a la primera pestaña
-    "📦 4 · Paquete",
+tickets = st.session_state.tickets
+# Etiquetas fijas: si una etiqueta cambia, Streamlit vuelve a la primera pestaña.
+tab_in, tab_salud, tab_cur, tab_tk, tab_pkg, tab_cfg = st.tabs([
+    "📥 1 · Ingesta", "📊 2 · Salud de la comunidad", "✍️ 3 · Curaduría", "🎫 4 · Tickets", "📦 5 · Paquete",
+    "⚙️ Panel de control",
 ])
 
 # ============================================================ 1 · ingesta
@@ -208,7 +396,7 @@ with tab_in:
         payload = {"origen_comunidad": st.session_state.origen, "periodo_referencia": st.session_state.periodo,
                    "interacciones": editado.to_dict("records")}
         try:
-            motor = pl.MotorCommunityLab(voz_marca=voz, umbral_exito=umbral, max_por_ruta=max_por_ruta)
+            motor = crear_motor()
         except Exception as e:  # noqa: BLE001
             st.error(f"No se pudo iniciar el motor: {e}")
             st.stop()
@@ -221,18 +409,14 @@ with tab_in:
                 st.stop()
             estado.update(label=f"Listo: {resultado['resumen']['total_interacciones_procesadas']} interacciones → "
                                 f"{len(resultado['activos'])} activos generados", state="complete", expanded=False)
-        _limpiar_widgets_activos()
-        st.session_state.resultado = resultado
-        st.session_state.activos = resultado["activos"]
-        st.session_state.guardado = None
-        st.session_state.listado = None
+        aplicar_resultado(resultado, payload)
         st.rerun()
 
     if res:
         for aviso in res.get("avisos", []):
             st.warning(aviso)
         st.success(f"Último procesamiento: {res['generado_en']} · motor {res['motor']['modelo']} · "
-                   f"{len(activos)} activos. Revisa las pestañas 2, 3 y 4.")
+                   f"{len(activos)} activos y {len(tickets)} tickets. Revisa las pestañas siguientes.")
 
 # ============================================================ 2 · salud
 with tab_salud:
@@ -336,7 +520,8 @@ with tab_cur:
                 info = []
                 if a["tipo"] == "post_x":
                     n = len(a["contenido"])
-                    info.append(f"{'🔴' if n > 280 else '🟢'} {n}/280 caracteres")
+                    lim = st.session_state.config["limite_x"]
+                    info.append(f"{'🔴' if n > lim else '🟢'} {n}/{lim} caracteres")
                 elif a["tipo"] == "post_linkedin":
                     info.append(f"{len(a['contenido'])} caracteres · engagement estimado: "
                                 f"{a['meta'].get('potencial_engagement', '—')}")
@@ -363,13 +548,105 @@ with tab_cur:
                         st.markdown(f"### {a['titulo']}")
                         st.markdown(a["contenido"])
 
-# ============================================================ 4 · paquete
+# ============================================================ 4 · tickets
+with tab_tk:
+    if not res:
+        st.info("Procesa un lote para ver las consultas que el bot no pudo resolver solo.")
+    else:
+        cfg = st.session_state.config
+        abiertos = [t for t in tickets if t["estado"] != "Resuelto"]
+        vencidos = [t for t in abiertos if pl.ticket_vencido(t)]
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Abiertos", len(abiertos))
+        k2.metric("Prioridad alta abiertos", sum(t["prioridad"] == "Alta" for t in abiertos))
+        k3.metric("Vencidos", len(vencidos), help="Abiertos que ya pasaron su SLA.")
+        k4.metric("Resueltos", len(tickets) - len(abiertos))
+        if tickets:
+            st.progress((len(tickets) - len(abiertos)) / len(tickets),
+                        text=f"{len(tickets) - len(abiertos)} de {len(tickets)} tickets resueltos")
+        st.caption("Se crea un ticket cuando el bot no puede resolver una consulta solo: miembros que necesitan apoyo, "
+                   "dudas sin respuesta confiable y dudas que superaron el máximo por ruta.")
+
+        if st.session_state.msg_ticket:
+            nivel, texto = st.session_state.msg_ticket
+            getattr(st, nivel)(texto)
+            st.session_state.msg_ticket = None
+
+        f1, f2, f3 = st.columns(3)
+        est_sel = f1.multiselect("Estado", pl.ESTADOS_TICKET, default=["Pendiente", "En progreso", "Escalado"],
+                                 format_func=ICONO_TICKET.get)
+        pri_sel = f2.multiselect("Prioridad", pl.PRIORIDADES, default=pl.PRIORIDADES, format_func=ICONO_PRIORIDAD.get)
+        resp_sel = f3.selectbox("Responsable", ["Todos", SIN_ASIGNAR] + cfg["equipo"])
+        visibles = [t for t in tickets if t["estado"] in est_sel and t["prioridad"] in pri_sel
+                    and (resp_sel == "Todos" or (t["asignado_a"] or SIN_ASIGNAR) == resp_sel)]
+
+        if not tickets:
+            st.success("No hay tickets: el bot pudo atender todas las consultas de este lote.")
+        elif not visibles:
+            st.info("Ningún ticket coincide con los filtros.")
+
+        opciones_resp = [SIN_ASIGNAR] + cfg["equipo"]
+        for t in visibles:
+            tid = t["id"]
+            st.session_state.setdefault(f"tk_est_{tid}", t["estado"])
+            st.session_state.setdefault(f"tk_asig_{tid}", t["asignado_a"] if t["asignado_a"] in cfg["equipo"] else SIN_ASIGNAR)
+            st.session_state.setdefault(f"tk_resp_{tid}", t["respuesta"])
+            with st.container(border=True):
+                h1, h2 = st.columns([5, 1.4])
+                vence = datetime.fromisoformat(t["vence_en"])
+                aviso = " · ⏰ **vencido**" if pl.ticket_vencido(t) else (
+                    "" if t["estado"] == "Resuelto" else f" · vence {vence:%d/%m %H:%M}")
+                h1.markdown(f"**{tid}** · {ICONO_PRIORIDAD[t['prioridad']]} · <span class='chip'>{t['tipo']}</span>"
+                            f"<span class='muted'>{t['autor']} · {t['canal']}{aviso}</span>", unsafe_allow_html=True)
+                h2.markdown(f"**{ICONO_TICKET[t['estado']]}**")
+                st.markdown(f"> {t['mensaje']}")
+                st.caption(f"Motivo: {t['motivo']}" + (f" · Temas: {', '.join(t['temas'])}" if t["temas"] else ""))
+
+                resuelto = t["estado"] == "Resuelto"
+                c1, c2 = st.columns(2)
+                c1.selectbox("Responsable", opciones_resp, key=f"tk_asig_{tid}", disabled=resuelto)
+                c2.selectbox("Estado", pl.ESTADOS_TICKET, key=f"tk_est_{tid}", format_func=ICONO_TICKET.get,
+                             disabled=resuelto)
+                st.text_area("Respuesta al miembro", key=f"tk_resp_{tid}", height=100, disabled=resuelto,
+                             placeholder="Escribe la respuesta o la acción tomada…")
+                if t["activo_id"] and not resuelto:
+                    st.checkbox("Usar esta respuesta en el borrador del FAQ", value=True, key=f"tk_faq_{tid}")
+
+                b1, b2, b3, b4 = st.columns([1, 1, 1, 2])
+                if resuelto:
+                    b1.button("↩️ Reabrir", key=f"tk_reab_{tid}", on_click=reabrir_ticket, args=(tid,), width="stretch")
+                else:
+                    b1.button("💾 Guardar", key=f"tk_guar_{tid}", on_click=guardar_ticket, args=(tid,), width="stretch")
+                    b2.button("✅ Resolver", key=f"tk_res_{tid}", on_click=resolver_ticket, args=(tid,),
+                              type="primary", width="stretch")
+                    b3.button("⬆️ Escalar", key=f"tk_esc_{tid}", on_click=escalar_ticket, args=(tid,),
+                              disabled=t["estado"] == "Escalado", width="stretch")
+                with b4.popover("🕘 Historial", width="stretch"):
+                    for linea in t["historial"]:
+                        st.markdown(f"- {linea}")
+
+        with st.expander("➕ Crear ticket manual"):
+            m1, m2 = st.columns(2)
+            m1.text_input("Autor", key="nt_autor")
+            m2.text_input("Canal", key="nt_canal", placeholder="#general")
+            m3, m4 = st.columns(2)
+            m3.selectbox("Tipo", ["Duda técnica", "Apoyo al miembro", "Incidencia de contenido", "Otro"], key="nt_tipo")
+            m4.selectbox("Prioridad", pl.PRIORIDADES, index=1, key="nt_prioridad", format_func=ICONO_PRIORIDAD.get)
+            st.text_area("Mensaje", key="nt_mensaje", height=80)
+            st.button("Crear ticket", on_click=crear_ticket_manual)
+
+        if tickets:
+            df_tk = pd.DataFrame(pl.resumen_tickets(tickets)["detalle"])
+            st.download_button("⬇️ Exportar tickets (CSV)", df_tk.to_csv(index=False).encode("utf-8-sig"),
+                               f"tickets-{pl.slug(res['periodo_referencia'])}.csv", "text/csv")
+
+# ============================================================ 5 · paquete
 with tab_pkg:
     if not res:
         st.info("Procesa un lote y aprueba activos para armar el paquete de distribución.")
     else:
         incluir = st.toggle("Incluir activos pendientes (no aprobados aún)", value=False)
-        paquete = pl.construir_paquete(res, activos, incluir)
+        paquete = pl.construir_paquete(res, activos, incluir, tickets=tickets)
         cur = paquete["curaduria"]
         n_pkg = sum(len(v) for v in paquete["activos_distribucion_generados"].values())
         k1, k2, k3, k4 = st.columns(4)
@@ -419,3 +696,78 @@ with tab_pkg:
                     st.dataframe(pd.DataFrame(st.session_state.listado), hide_index=True, width="stretch")
                 else:
                     st.caption("Aún no hay paquetes guardados.")
+
+
+# ============================================================ panel de control
+with tab_cfg:
+    cfg = st.session_state.config
+    v = st.session_state.cfg_ver
+    st.markdown("#### ⚙️ Panel de control")
+    st.caption("Ajusta cómo el sistema clasifica, redacta y deriva consultas. "
+               "Los cambios se aplican en el próximo procesamiento o al reprocesar el lote actual.")
+    if st.session_state.msg_panel:
+        nivel, texto = st.session_state.msg_panel
+        getattr(st, nivel)(texto)
+        st.session_state.msg_panel = None
+
+    with st.form("form_config"):
+        st.markdown("##### 🔀 Reglas de ruteo")
+        r1, r2, r3 = st.columns(3)
+        r1.slider("Sentimiento mínimo para caso de éxito", 0.0, 1.0, float(cfg["umbral_exito"]), 0.05,
+                  key=f"cfg_umbral_exito_{v}")
+        r2.slider("Sentimiento máximo para alerta de apoyo", -1.0, 0.0, float(cfg["umbral_alerta"]), 0.05,
+                  key=f"cfg_umbral_alerta_{v}", help="Mensajes con sentimiento igual o menor generan una alerta.")
+        r3.number_input("Máx. mensajes a transformar por ruta", 1, 20, int(cfg["max_por_ruta"]),
+                        key=f"cfg_max_por_ruta_{v}")
+        st.text_input("Palabras que disparan una alerta (separadas por coma)", ", ".join(cfg["palabras_alerta"]),
+                      key=f"cfg_palabras_alerta_{v}")
+
+        st.markdown("##### ✍️ Voz y publicaciones")
+        st.text_area("Voz de marca", cfg["voz"], height=120, key=f"cfg_voz_{v}")
+        p1, p2 = st.columns([3, 1])
+        p1.text_input("Hashtags fijos", " ".join(cfg["hashtags_base"]), key=f"cfg_hashtags_base_{v}")
+        p2.number_input("Límite de caracteres en X", 100, 4000, int(cfg["limite_x"]), key=f"cfg_limite_x_{v}")
+
+        st.markdown("##### 🎫 Tickets")
+        t1, t2 = st.columns([2, 3])
+        t1.text_area("Equipo de soporte (uno por línea)", "\n".join(cfg["equipo"]), height=130, key=f"cfg_equipo_{v}")
+        with t2:
+            s1, s2, s3 = st.columns(3)
+            s1.number_input("SLA alta (h)", 1, 720, int(cfg["sla"]["Alta"]), key=f"cfg_sla_alta_{v}")
+            s2.number_input("SLA media (h)", 1, 720, int(cfg["sla"]["Media"]), key=f"cfg_sla_media_{v}")
+            s3.number_input("SLA baja (h)", 1, 720, int(cfg["sla"]["Baja"]), key=f"cfg_sla_baja_{v}")
+            st.checkbox("Crear tickets para alertas de apoyo", cfg["tickets_alertas"], key=f"cfg_tk_alertas_{v}")
+            st.checkbox("Crear tickets para dudas que el bot no puede responder", cfg["tickets_derivadas"],
+                        key=f"cfg_tk_derivadas_{v}")
+            st.checkbox("Crear tickets para dudas que superan el máximo por ruta", cfg["tickets_excedentes"],
+                        key=f"cfg_tk_excedentes_{v}")
+
+        st.form_submit_button("💾 Guardar configuración", type="primary", on_click=guardar_config)
+
+    a1, a2, a3 = st.columns(3)
+    a1.button("🔁 Reprocesar el lote actual", on_click=reprocesar, disabled=not st.session_state.ultimo_payload,
+              width="stretch", help="Vuelve a analizar el último lote con la configuración guardada. "
+                                    "Se pierden las aprobaciones y los tickets de esa corrida.")
+    a2.button("↺ Restablecer valores por defecto", on_click=restablecer_config, width="stretch")
+    a3.download_button("⬇️ Exportar configuración", json.dumps(cfg, ensure_ascii=False, indent=2),
+                       "communitylab-config.json", "application/json", width="stretch")
+    with st.expander("⬆️ Importar configuración"):
+        archivo_cfg = st.file_uploader("Archivo JSON exportado desde este panel", type=["json"], key=f"cfg_file_{v}")
+        st.button("Importar", on_click=importar_config, args=(archivo_cfg,))
+
+    st.markdown("##### 🩺 Estado del sistema")
+    guardados = almacen_activo().listar()
+    estado = pd.DataFrame([
+        {"Componente": "Motor", "Estado": "🟢 Demostración (heurísticas y plantillas)"},
+        {"Componente": "Último procesamiento", "Estado": res["generado_en"].replace("T", " ") if res else "—"},
+        {"Componente": "Interacciones del último lote",
+         "Estado": str(res["resumen"]["total_interacciones_procesadas"]) if res else "—"},
+        {"Componente": "Activos generados / aprobados",
+         "Estado": f"{len(activos)} / {sum(a['estado'] == 'aprobado' for a in activos)}" if res else "—"},
+        {"Componente": "Tickets abiertos / total",
+         "Estado": f"{sum(t['estado'] != 'Resuelto' for t in tickets)} / {len(tickets)}" if res else "—"},
+        {"Componente": "Archivos guardados", "Estado": f"{len(guardados)} en salida_local/"},
+    ])
+    st.dataframe(estado, hide_index=True, width="stretch")
+    st.button("🧹 Limpiar sesión", on_click=limpiar_sesion,
+              help="Borra el lote, los activos y los tickets de esta sesión. Conserva la configuración.")
