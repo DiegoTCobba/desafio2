@@ -1,6 +1,21 @@
+# Sin "base": la app sigue el tema del sistema y cada usuario puede elegir
+# Claro / Oscuro desde el menú ⋮ → Settings (Streamlit lo recuerda en su navegador).
+
 [theme]
 primaryColor = "#C74634"
-base = "light"
+baseRadius = "medium"
+
+[theme.light]
+primaryColor = "#C74634"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F4F2F7"
+textColor = "#1F1D24"
+
+[theme.dark]
+primaryColor = "#E86A55"
+backgroundColor = "#111018"
+secondaryBackgroundColor = "#1D1B26"
+textColor = "#ECEAF2"
 
 [server]
 maxUploadSize = 20
