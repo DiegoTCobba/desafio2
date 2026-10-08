@@ -11,7 +11,7 @@ import re
 import unicodedata
 import uuid
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -51,6 +51,13 @@ TIPOS_ACTIVO = {
     "newsletter": "Newsletter",
     "highlights": "Community Highlights",
 }
+PALABRAS_ALERTA_DEFAULT = ["abandon", "no puedo mas", "frustr", "me rindo"]
+HASHTAGS_BASE_DEFAULT = ["#ComunidadONE", "#TalentosTech"]
+
+ESTADOS_TICKET = ["Pendiente", "En progreso", "Escalado", "Resuelto"]
+PRIORIDADES = ["Alta", "Media", "Baja"]
+SLA_DEFAULT = {"Alta": 4, "Media": 24, "Baja": 72}  # horas hasta el vencimiento
+
 ORDEN_SENTIMIENTO = ["Altamente Positivo", "Positivo", "Neutral", "Negativo", "Altamente Negativo"]
 
 
@@ -134,7 +141,7 @@ BASE_RELEVANCIA = {"testimonio": 80, "proyecto_destacado": 75, "pregunta_tecnica
                    "feedback": 50, "debate": 45, "otro": 25}
 
 
-def analizar_heuristico(it: dict) -> dict:
+def analizar_heuristico(it: dict, palabras_alerta: list[str] | None = None) -> dict:
     t = _norm(it["texto"])
     pos = sum(t.count(w) for w in POSITIVAS) + sum(it["texto"].count(e) for e in EMOJIS_POS) * 0.5
     neg = sum(t.count(w) for w in NEGATIVAS)
@@ -166,17 +173,17 @@ def analizar_heuristico(it: dict) -> dict:
         "temas": temas,
         "relevancia": relevancia,
         "cita_destacada": cita,
-        "requiere_apoyo": any(w in t for w in ["abandon", "no puedo mas", "frustr", "me rindo"])
+        "requiere_apoyo": any(_norm(w) in t for w in (palabras_alerta or PALABRAS_ALERTA_DEFAULT) if w.strip())
                           or (puntaje <= -0.3 and tipo != "pregunta_tecnica"),
         "justificacion": "Clasificación heurística por palabras clave (motor de demostración).",
         "motor": "heuristico",
     }
 
 
-def enrutar(a: dict, umbral_exito: float) -> str:
+def enrutar(a: dict, umbral_exito: float, umbral_alerta: float = -0.4) -> str:
     """Bifurcación condicional del flujo."""
     # Una duda técnica con un "error" no es una alerta: solo si hay señales explícitas de frustración.
-    if a["requiere_apoyo"] or (a["sentimiento_puntaje"] <= -0.4 and a["categoria"] != "pregunta_tecnica"):
+    if a["requiere_apoyo"] or (a["sentimiento_puntaje"] <= umbral_alerta and a["categoria"] != "pregunta_tecnica"):
         return "alerta_apoyo"
     if a["categoria"] in ("testimonio", "proyecto_destacado") and a["sentimiento_puntaje"] >= umbral_exito:
         return "caso_exito"
@@ -204,19 +211,24 @@ def _nombre(autor: str) -> str:
 
 # ============================================================ motor
 class MotorCommunityLab:
-    def __init__(self, voz_marca: str = VOZ_MARCA_DEFAULT, umbral_exito: float = 0.5, max_por_ruta: int = 3):
+    def __init__(self, voz_marca: str = VOZ_MARCA_DEFAULT, umbral_exito: float = 0.5, max_por_ruta: int = 3,
+                 umbral_alerta: float = -0.4, palabras_alerta: list[str] | None = None,
+                 hashtags_base: list[str] | None = None):
         self.voz = voz_marca or VOZ_MARCA_DEFAULT
         self.umbral, self.max_por_ruta = umbral_exito, int(max_por_ruta)
+        self.umbral_alerta = umbral_alerta
+        self.palabras_alerta = palabras_alerta or PALABRAS_ALERTA_DEFAULT
+        self.hashtags_base = hashtags_base if hashtags_base is not None else HASHTAGS_BASE_DEFAULT
         self.avisos: list[str] = []
 
     # ---------------------------------------------------------------- 1. análisis
     def analizar(self, items: list[dict]) -> list[dict]:
         salida = []
         for it in items:
-            a = analizar_heuristico(it)
+            a = analizar_heuristico(it, self.palabras_alerta)
             a.update(it)
             a["sentimiento"] = etiqueta_sentimiento(a["sentimiento_puntaje"])
-            a["ruta"] = enrutar(a, self.umbral)
+            a["ruta"] = enrutar(a, self.umbral, self.umbral_alerta)
             a["puntaje_relevancia"] = puntaje_relevancia(a)
             salida.append(a)
         return sorted(salida, key=lambda x: x["puntaje_relevancia"], reverse=True)
@@ -255,7 +267,7 @@ class MotorCommunityLab:
     def _gen_exito(self, a: dict) -> list[dict]:
         def plantilla():
             nom = _nombre(a["autor"])
-            tags = " ".join(dict.fromkeys([HASHTAGS[t] for t in a["temas"] if t in HASHTAGS] + ["#ComunidadONE", "#TalentosTech"]))
+            tags = " ".join(dict.fromkeys([HASHTAGS[t] for t in a["temas"] if t in HASHTAGS] + list(self.hashtags_base)))
             caso = {"titulo": f"Caso de éxito: {a['autor']}",
                     "contexto": f"Compartido en {a['canal']} ({', '.join(a['temas'])}).",
                     "cita": a["cita_destacada"],
@@ -268,7 +280,7 @@ class MotorCommunityLab:
                            f"Historias como la de {nom} demuestran que construir es el mejor camino para impulsar una carrera tech.\n\n"
                            f"¡Felicitaciones, {nom}! 👏\n\n{tags}"),
                   "potencial_engagement": "Alto" if a["puntaje_relevancia"] >= 75 else "Medio"}
-            x = {"copy": f"🎉 {nom} lo logró: “{' '.join(a['cita_destacada'].split()[:18])}…” Así se construye una carrera tech: con proyectos reales. #ComunidadONE"}
+            x = {"copy": f"🎉 {nom} lo logró: “{' '.join(a['cita_destacada'].split()[:18])}…” Así se construye una carrera tech: con proyectos reales. {(self.hashtags_base or [''])[0]}".strip()}
             return caso, li, x
 
         caso, li, x = plantilla()
@@ -379,7 +391,8 @@ class MotorCommunityLab:
 
 
 # ============================================================ paquete de distribución
-def construir_paquete(resultado: dict, activos: list[dict], incluir_pendientes: bool = False) -> dict:
+def construir_paquete(resultado: dict, activos: list[dict], incluir_pendientes: bool = False,
+                      tickets: list[dict] | None = None) -> dict:
     sel = [a for a in activos if a["estado"] == "aprobado" or (incluir_pendientes and a["estado"] == "pendiente")]
     grupos: dict[str, list] = {"posts_linkedin": [], "posts_x": [], "casos_exito": [],
                                "sugerencias_contenido_faq": [], "destaque_newsletter_semanal": [],
@@ -425,6 +438,7 @@ def construir_paquete(resultado: dict, activos: list[dict], incluir_pendientes: 
         "activos_distribucion_generados": {k: v for k, v in grupos.items() if v},
         "curaduria": {"aprobados": estados.get("aprobado", 0), "rechazados": estados.get("rechazado", 0),
                       "pendientes": estados.get("pendiente", 0)},
+        "tickets_soporte": resumen_tickets(tickets or []),
     }
 
 
@@ -452,6 +466,11 @@ def informe_markdown(paquete: dict) -> str:
         md += ["", f"## {p['tema']}", p["contenido"]]
     for p in ag.get("destaque_newsletter_semanal", []):
         md += ["", f"## Newsletter · {p['seccion']}", f"**{p['titular']}**", "", p["resumen"]]
+    tk = paquete.get("tickets_soporte") or {}
+    if tk.get("total"):
+        md += ["", "## Tickets de soporte",
+               f"- Total: {tk['total']} · abiertos: {tk['abiertos']} · resueltos: {tk['resueltos']}"]
+        md += [f"- **{t['id']}** · {t['prioridad']} · {t['estado']} · {t['autor']}: {t['motivo']}" for t in tk["detalle"]]
     return "\n".join(md) + "\n"
 
 
@@ -473,6 +492,92 @@ def guardar_paquete(almacen, paquete: dict, resultado: dict) -> dict:
     if not ok:
         paquete["almacenamiento_oci"]["status"] = "error"
     return {"ok": ok, "carpeta": carpeta, "objetos": guardados, "paquete": paquete}
+
+
+# ============================================================ tickets
+def _ahora() -> datetime:
+    return datetime.now().replace(microsecond=0)
+
+
+def generar_tickets(resultado: dict, activos: list[dict], sla: dict | None = None,
+                    incluir_alertas: bool = True, incluir_derivadas: bool = True,
+                    incluir_excedentes: bool = True) -> list[dict]:
+    """Crea un ticket por cada consulta que el bot no pudo resolver solo.
+
+    - Alerta de apoyo: un miembro con frustración o riesgo de abandono (prioridad alta).
+    - Duda derivada a mentoría: el FAQ generado no tiene una respuesta confiable.
+    - Duda sin atender: preguntas que superaron el máximo de mensajes a transformar por ruta.
+    """
+    sla = {**SLA_DEFAULT, **(sla or {})}
+    faq_por_interaccion = {a["interaccion_id"]: a for a in activos if a["tipo"] == "faq"}
+    tickets = []
+    for a in resultado["analisis"]:
+        faq = faq_por_interaccion.get(a["id"])
+        if a["ruta"] == "alerta_apoyo" and incluir_alertas:
+            tipo, motivo, prioridad = "Apoyo al miembro", "Frustración o riesgo de abandono", "Alta"
+        elif a["ruta"] == "faq" and faq and faq["meta"].get("status") == "derivado_a_mentoria" and incluir_derivadas:
+            tipo, motivo = "Duda técnica", "El bot no tiene una respuesta confiable"
+            prioridad = "Media" if a["puntaje_relevancia"] >= 60 else "Baja"
+        elif a["ruta"] == "faq" and not faq and incluir_excedentes:
+            tipo, motivo, prioridad = "Duda técnica", "Duda sin atender (superó el máximo por ruta)", "Baja"
+        else:
+            continue
+        creado = _ahora()
+        tickets.append({
+            "id": "", "relevancia": a["puntaje_relevancia"], "interaccion_id": a["id"], "activo_id": faq["id"] if faq else None,
+            "tipo": tipo, "motivo": motivo, "prioridad": prioridad, "estado": "Pendiente",
+            "autor": a["autor"], "canal": a["canal"], "mensaje": a["texto"], "temas": a["temas"],
+            "asignado_a": "", "respuesta": "",
+            "creado_en": creado.isoformat(), "vence_en": (creado + timedelta(hours=sla[prioridad])).isoformat(),
+            "resuelto_en": None, "historial": [f"{creado:%H:%M} · creado automáticamente ({motivo.lower()})"],
+        })
+    orden = {p: i for i, p in enumerate(PRIORIDADES)}
+    tickets.sort(key=lambda t: (orden[t["prioridad"]], -t["relevancia"]))
+    for i, t in enumerate(tickets, 1):
+        t["id"] = f"TCK-{i:03d}"
+    return tickets
+
+
+def actualizar_ticket(t: dict, estado: str | None = None, asignado_a: str | None = None,
+                      respuesta: str | None = None) -> dict:
+    """Aplica cambios y deja rastro en el historial."""
+    hora = f"{_ahora():%H:%M}"
+    if asignado_a is not None and asignado_a != t["asignado_a"]:
+        t["asignado_a"] = asignado_a
+        t["historial"].append(f"{hora} · asignado a {asignado_a or 'nadie'}")
+    if respuesta is not None and respuesta != t["respuesta"]:
+        t["respuesta"] = respuesta
+        t["historial"].append(f"{hora} · respuesta actualizada")
+    if estado and estado != t["estado"]:
+        t["historial"].append(f"{hora} · {t['estado']} → {estado}")
+        t["estado"] = estado
+        t["resuelto_en"] = _ahora().isoformat() if estado == "Resuelto" else None
+    return t
+
+
+def ticket_vencido(t: dict) -> bool:
+    return t["estado"] != "Resuelto" and datetime.fromisoformat(t["vence_en"]) < _ahora()
+
+
+def respuesta_a_faq(activo: dict, respuesta: str) -> dict:
+    """Usa la respuesta del equipo en el borrador del FAQ y lo marca listo para revisión."""
+    activo["contenido"] = re.sub(r"\*\*Respuesta:\*\*.*?(\n\n|$)", lambda m: f"**Respuesta:** {respuesta}{m.group(1)}",
+                                 activo["contenido"], count=1, flags=re.S)
+    activo["meta"]["status"] = "listo_para_revision"
+    activo["estado"] = "pendiente"
+    return activo
+
+
+def resumen_tickets(tickets: list[dict]) -> dict:
+    estados = Counter(t["estado"] for t in tickets)
+    return {
+        "total": len(tickets),
+        "abiertos": len(tickets) - estados.get("Resuelto", 0),
+        "resueltos": estados.get("Resuelto", 0),
+        "por_estado": dict(estados),
+        "detalle": [{k: t[k] for k in ("id", "tipo", "motivo", "prioridad", "estado", "autor", "canal",
+                                       "asignado_a", "respuesta", "creado_en", "resuelto_en")} for t in tickets],
+    }
 
 
 # ============================================================ almacenamiento local
