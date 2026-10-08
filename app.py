@@ -1,5 +1,6 @@
 """CommunityLab · Interfaz Streamlit (frontend independiente)
 Ingesta → Salud → Curaduría → Tickets → Paquete, más un panel de control para ajustar el sistema.
+Protegida con contraseña (acceso.py) y con tema claro u oscuro (.streamlit/config.toml).
 Funciona sola con el motor de demostración (motor_demo.py): sin API key ni nube.
 
 Ejecutar:  streamlit run app.py
@@ -14,6 +15,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+import acceso
 import motor_demo as pl
 
 BASE = Path(__file__).parent
@@ -58,6 +60,9 @@ st.markdown("""
 .preview {border:1px solid rgba(128,128,128,.25); border-radius:12px; padding:14px 16px; white-space:pre-wrap;}
 </style>
 """, unsafe_allow_html=True)
+
+# Nada de la app se dibuja hasta que la contraseña sea correcta.
+acceso_cfg = acceso.requerir_ingreso()
 
 
 # ============================================================ estado
@@ -302,10 +307,11 @@ def reprocesar():
 
 
 def limpiar_sesion():
-    cfg, ver = st.session_state.config, st.session_state.cfg_ver
+    conservar = {k: st.session_state[k] for k in ("config", "cfg_ver", "autenticado", "acceso_ultima_actividad")
+                 if k in st.session_state}
     for k in list(st.session_state.keys()):
         del st.session_state[k]
-    st.session_state.config, st.session_state.cfg_ver = cfg, ver
+    st.session_state.update(conservar)
     st.session_state.msg_panel = ("info", "Sesión limpia. La configuración se conservó.")
 
 
@@ -329,6 +335,13 @@ with st.sidebar:
     abiertos = sum(t["estado"] != "Resuelto" for t in st.session_state.tickets)
     if abiertos:
         st.warning(f"🎫 {abiertos} ticket(s) abierto(s)")
+
+    st.divider()
+    if acceso_cfg["demo"]:
+        st.caption("⚠️ Usas la contraseña de demostración. Configura la tuya en `.streamlit/secrets.toml`.")
+    st.caption(f"🌗 Tema claro u oscuro: menú ⋮ → Settings · la sesión se cierra tras "
+               f"{acceso_cfg['minutos']} min sin actividad.")
+    st.button("🔒 Cerrar sesión", on_click=acceso.cerrar_sesion, width="stretch")
 
 
 def almacen_activo():

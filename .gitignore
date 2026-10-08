@@ -3,3 +3,4 @@ __pycache__/
 .pytest_cache/
 salida_local/
 .DS_Store
+.streamlit/secrets.toml
