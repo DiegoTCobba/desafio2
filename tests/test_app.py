@@ -15,11 +15,29 @@ def boton(at, texto):
     return next(b for b in at.button if texto in b.label)
 
 
+CLAVE = "clave-de-prueba"
+
+
+def nueva_app(clave=CLAVE):
+    at = AppTest.from_file(str(RAIZ / "app.py"), default_timeout=60)
+    if clave is not None:
+        at.secrets["auth"] = {"password": clave}
+    return at.run()
+
+
+def ingresar(at, clave=CLAVE):
+    at.text_input(key="login_password").input(clave)
+    boton(at, "Ingresar").click().run()
+    return at
+
+
 @pytest.fixture
 def app(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    at = AppTest.from_file(str(RAIZ / "app.py"), default_timeout=60).run()
-    assert not at.exception
+    monkeypatch.delenv("COMMUNITYLAB_PASSWORD", raising=False)
+    monkeypatch.delenv("COMMUNITYLAB_PASSWORD_SHA256", raising=False)
+    at = ingresar(nueva_app())
+    assert not at.exception and at.session_state.autenticado
     return at
 
 
@@ -164,3 +182,63 @@ def test_palabras_de_alerta_configurables():
     assert base["analisis"][0]["ruta"] != "alerta_apoyo"
     con = pl.MotorCommunityLab(palabras_alerta=["me aburro"]).procesar(datos)
     assert con["analisis"][0]["ruta"] == "alerta_apoyo"
+
+
+# ---------------------------------------------------------------- acceso
+def test_sin_contrasena_no_se_muestra_la_app(monkeypatch):
+    monkeypatch.delenv("COMMUNITYLAB_PASSWORD", raising=False)
+    at = nueva_app()
+    assert not at.exception
+    assert len(at.tabs) == 0
+    assert not any("Cargar lote" in b.label for b in at.button)
+
+
+def test_contrasena_incorrecta_y_bloqueo(monkeypatch):
+    import acceso
+    monkeypatch.delenv("COMMUNITYLAB_PASSWORD", raising=False)
+    at = nueva_app()
+    ingresar(at, "otra")
+    assert "autenticado" not in at.session_state
+    assert any("incorrecta" in e.value for e in at.error)
+    for _ in range(acceso.MAX_INTENTOS - 1):
+        ingresar(at, "otra")
+    assert any("bloqueado" in e.value.lower() for e in at.error)
+    # Mientras dura el bloqueo no se puede escribir ni enviar, ni siquiera la contraseña correcta.
+    assert at.text_input(key="login_password").disabled
+    assert boton(at, "Ingresar").disabled
+    assert "autenticado" not in at.session_state
+
+
+def test_ingreso_correcto_y_cierre_de_sesion(app):
+    assert len(app.tabs) == 6
+    boton(app, "Cerrar sesión").click().run()
+    assert len(app.tabs) == 0
+
+
+def test_contrasena_por_hash(monkeypatch):
+    import hashlib
+    monkeypatch.delenv("COMMUNITYLAB_PASSWORD", raising=False)
+    at = AppTest.from_file(str(RAIZ / "app.py"), default_timeout=60)
+    at.secrets["auth"] = {"password_sha256": hashlib.sha256(b"secreta").hexdigest()}
+    at.run()
+    assert not any("no hay una contraseña configurada" in i.value for i in at.info)
+    ingresar(at, "secreta")
+    assert at.session_state.autenticado
+    assert not any("contraseña de demostración" in c.value for c in at.caption)
+
+
+def test_contrasena_demo_avisa(monkeypatch):
+    import acceso
+    monkeypatch.delenv("COMMUNITYLAB_PASSWORD", raising=False)
+    monkeypatch.delenv("COMMUNITYLAB_PASSWORD_SHA256", raising=False)
+    at = nueva_app(clave=None)
+    assert any("no hay una contraseña configurada" in i.value for i in at.info)
+    ingresar(at, acceso.CONTRASENA_DEMO)
+    assert at.session_state.autenticado
+    assert any("contraseña de demostración" in c.value for c in at.caption)
+
+
+def test_limpiar_sesion_no_cierra_la_sesion(app):
+    boton(app, "Cargar lote de ejemplo").click().run()
+    boton(app, "Limpiar sesión").click().run()
+    assert app.session_state.autenticado and app.session_state.df is None
