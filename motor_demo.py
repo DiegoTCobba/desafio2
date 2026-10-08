@@ -449,7 +449,8 @@ def informe_markdown(paquete: dict) -> str:
           f"_Generado: {paquete['generado_en']} · motor: {paquete['motor']['modelo']}_", "",
           "## Salud de la comunidad",
           f"- Interacciones: **{r['total_interacciones_procesadas']}**",
-          f"- Sentimiento predominante: **{r['sentimiento_predominante']}** ({r['puntaje_sentimiento_promedio']:+.2f})",
+          f"- Sentimiento predominante: **{r['sentimiento_predominante']}**"
+          + ("" if r['puntaje_sentimiento_promedio'] is None else f" ({r['puntaje_sentimiento_promedio']:+.2f})"),
           f"- Temas principales: {', '.join(r['temas_principales'])}",
           f"- Alertas de apoyo: {r['alertas_apoyo']}"]
     if r.get("lectura_salud"):
@@ -494,6 +495,23 @@ def guardar_paquete(almacen, paquete: dict, resultado: dict) -> dict:
     return {"ok": ok, "carpeta": carpeta, "objetos": guardados, "paquete": paquete}
 
 
+# ============================================================ opciones del request
+TIPOS_POR_OPCION = {
+    "generar_linkedin": {"post_linkedin", "post_x", "caso_exito"},
+    "generar_newsletter": {"newsletter", "highlights"},
+    "generar_faq": {"faq"},
+}
+
+
+def filtrar_por_opciones(activos: list[dict], opciones: dict) -> list[dict]:
+    """Deja solo los tipos de activo pedidos en `opciones` (generar_linkedin, generar_newsletter, generar_faq)."""
+    excluidos = set()
+    for opcion, tipos in TIPOS_POR_OPCION.items():
+        if opciones.get(opcion) is False:
+            excluidos |= tipos
+    return [a for a in activos if a["tipo"] not in excluidos]
+
+
 # ============================================================ tickets
 def _ahora() -> datetime:
     return datetime.now().replace(microsecond=0)
@@ -531,6 +549,22 @@ def generar_tickets(resultado: dict, activos: list[dict], sla: dict | None = Non
             "creado_en": creado.isoformat(), "vence_en": (creado + timedelta(hours=sla[prioridad])).isoformat(),
             "resuelto_en": None, "historial": [f"{creado:%H:%M} · creado automáticamente ({motivo.lower()})"],
         })
+    ids_analizados = {a["id"] for a in resultado["analisis"]}
+    for faq in activos:
+        if (faq["tipo"] != "faq" or faq["interaccion_id"] in ids_analizados or not incluir_derivadas
+                or faq["meta"].get("status") != "derivado_a_mentoria"):
+            continue
+        creado = _ahora()
+        pregunta = re.search(r"\*\*Pregunta:\*\*\s*(.+?)(\n\n|$)", faq["contenido"], flags=re.S)
+        tickets.append({
+            "id": "", "relevancia": 0, "interaccion_id": faq["interaccion_id"], "activo_id": faq["id"],
+            "tipo": "Duda técnica", "motivo": "El bot no tiene una respuesta confiable", "prioridad": "Media",
+            "estado": "Pendiente", "autor": faq["meta"].get("autor") or faq["origen"], "canal": faq["meta"].get("canal", ""),
+            "mensaje": pregunta.group(1).strip() if pregunta else faq["titulo"], "temas": [],
+            "asignado_a": "", "respuesta": "",
+            "creado_en": creado.isoformat(), "vence_en": (creado + timedelta(hours=sla["Media"])).isoformat(),
+            "resuelto_en": None, "historial": [f"{creado:%H:%M} · creado automáticamente (derivado a mentoría)"],
+        })
     orden = {p: i for i, p in enumerate(PRIORIDADES)}
     tickets.sort(key=lambda t: (orden[t["prioridad"]], -t["relevancia"]))
     for i, t in enumerate(tickets, 1):
@@ -553,6 +587,18 @@ def actualizar_ticket(t: dict, estado: str | None = None, asignado_a: str | None
         t["estado"] = estado
         t["resuelto_en"] = _ahora().isoformat() if estado == "Resuelto" else None
     return t
+
+
+def horas_resolucion(t: dict) -> float | None:
+    if not t.get("resuelto_en"):
+        return None
+    return round((datetime.fromisoformat(t["resuelto_en"]) - datetime.fromisoformat(t["creado_en"])).total_seconds() / 3600, 1)
+
+
+def dentro_de_sla(t: dict) -> bool | None:
+    if not t.get("resuelto_en"):
+        return None
+    return datetime.fromisoformat(t["resuelto_en"]) <= datetime.fromisoformat(t["vence_en"])
 
 
 def ticket_vencido(t: dict) -> bool:
