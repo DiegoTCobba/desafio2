@@ -17,6 +17,7 @@ import streamlit as st
 
 import acceso
 import motor_demo as pl
+import n8n_cliente
 
 BASE = Path(__file__).parent
 EJEMPLO = BASE / "data" / "interacciones_semana04.json"
@@ -29,7 +30,20 @@ ICONO_PRIORIDAD = {"Alta": "🔴 Alta", "Media": "🟠 Media", "Baja": "🟢 Baj
 ICONO_TICKET = {"Pendiente": "🕓 Pendiente", "En progreso": "🔧 En progreso", "Escalado": "⬆️ Escalado",
                 "Resuelto": "✅ Resuelto"}
 SIN_ASIGNAR = "Sin asignar"
+MOTORES = {"demo": "Demo local (sin conexión)", "n8n": "n8n (webhook)"}
+IDIOMAS = {"es": "Español", "pt": "Portugués", "en": "Inglés"}
+TONOS = ["inspirador", "profesional", "cercano", "técnico"]
 CONFIG_DEFAULT = {
+    # Conexión y opciones que viajan en el request (las reglas de IA viven en n8n)
+    "motor": "demo",
+    "n8n_url": "",
+    "n8n_timeout": 120,
+    "generar_linkedin": True,
+    "generar_newsletter": True,
+    "generar_faq": True,
+    "idioma": "es",
+    "tono": "inspirador",
+    # Reglas del motor de demostración (solo se usan sin n8n)
     "voz": pl.VOZ_MARCA_DEFAULT,
     "umbral_exito": 0.4,
     "umbral_alerta": -0.4,
@@ -66,6 +80,18 @@ acceso_cfg = acceso.requerir_ingreso()
 
 
 # ============================================================ estado
+def _secrets() -> dict:
+    try:
+        return {k: dict(v) for k, v in st.secrets.items() if hasattr(v, "items")}
+    except Exception:  # noqa: BLE001  (no existe secrets.toml)
+        return {}
+
+
+CRED_N8N = n8n_cliente.credenciales(_secrets())
+if CRED_N8N["webhook_url"]:
+    CONFIG_DEFAULT.update(motor="n8n", n8n_url=CRED_N8N["webhook_url"])
+
+
 def init_state():
     defaults = {"df": None, "df_ver": 0, "origen": "Discord_Grupo_ONE_G10", "periodo": "Semana_04",
                 "resultado": None, "activos": [], "guardado": None, "msg_ingesta": None,
@@ -156,6 +182,22 @@ def crear_motor():
                                 hashtags_base=c["hashtags_base"])
 
 
+def opciones_request():
+    c = st.session_state.config
+    return {k: c[k] for k in ("generar_linkedin", "generar_newsletter", "generar_faq", "idioma", "tono")}
+
+
+def ejecutar(payload, progreso=None):
+    """Procesa el lote con n8n o con el motor de demostración, según el panel de control."""
+    c = st.session_state.config
+    payload = {**payload, "opciones": opciones_request()}
+    if c["motor"] == "n8n":
+        return n8n_cliente.procesar(payload, c["n8n_url"], c["n8n_timeout"], CRED_N8N, progreso), payload
+    resultado = crear_motor().procesar(payload, progreso=progreso)
+    resultado["activos"] = pl.filtrar_por_opciones(resultado["activos"], payload["opciones"])
+    return resultado, payload
+
+
 def aplicar_resultado(resultado, payload):
     c = st.session_state.config
     for k in [k for k in st.session_state if str(k).startswith(("txt_", "tit_", "tk_"))]:
@@ -203,7 +245,7 @@ def resolver_ticket(tid):
         return
     pl.actualizar_ticket(t, estado="Resuelto", asignado_a=asignado, respuesta=respuesta)
     st.session_state[f"tk_est_{tid}"] = "Resuelto"
-    msg = f"{tid} resuelto."
+    msg = f"{tid} resuelto. Lo encuentras en la bandeja **Resueltos**."
     if t["activo_id"] and st.session_state.get(f"tk_faq_{tid}", True):
         activo = buscar(t["activo_id"])
         pl.respuesta_a_faq(activo, respuesta.strip())
@@ -225,6 +267,7 @@ def reabrir_ticket(tid):
     t = buscar_ticket(tid)
     pl.actualizar_ticket(t, estado="En progreso" if t["asignado_a"] else "Pendiente")
     st.session_state[f"tk_est_{tid}"] = t["estado"]
+    st.session_state.msg_ticket = ("info", f"{tid} reabierto: está de nuevo en la bandeja de abiertos.")
 
 
 def crear_ticket_manual():
@@ -263,7 +306,15 @@ def guardar_config():
     if not equipo:
         st.session_state.msg_panel = ("warning", "El equipo de soporte necesita al menos una persona o área.")
         return
+    motor = g("motor")
+    url = g("n8n_url").strip()
+    if motor == "n8n" and not url.startswith(("http://", "https://")):
+        st.session_state.msg_panel = ("warning", "Para usar n8n, pega la URL completa del webhook (http:// o https://).")
+        return
     st.session_state.config = {
+        "motor": motor, "n8n_url": url, "n8n_timeout": int(g("n8n_timeout")),
+        "generar_linkedin": g("generar_linkedin"), "generar_newsletter": g("generar_newsletter"),
+        "generar_faq": g("generar_faq"), "idioma": g("idioma"), "tono": g("tono"),
         "voz": g("voz").strip() or pl.VOZ_MARCA_DEFAULT,
         "umbral_exito": g("umbral_exito"), "umbral_alerta": g("umbral_alerta"), "max_por_ruta": int(g("max_por_ruta")),
         "palabras_alerta": _lista(g("palabras_alerta")) or list(pl.PALABRAS_ALERTA_DEFAULT),
@@ -302,8 +353,19 @@ def importar_config(archivo):
 def reprocesar():
     payload = st.session_state.ultimo_payload
     if payload:
-        aplicar_resultado(crear_motor().procesar(payload), payload)
+        try:
+            resultado, payload = ejecutar({k: v for k, v in payload.items() if k != "opciones"})
+        except Exception as e:  # noqa: BLE001
+            st.session_state.msg_panel = ("error", f"No se pudo reprocesar: {e}")
+            return
+        aplicar_resultado(resultado, payload)
         st.session_state.msg_panel = ("success", "Lote reprocesado con la configuración actual.")
+
+
+def probar_n8n():
+    c = st.session_state.config
+    ok, msg = n8n_cliente.probar_conexion(c["n8n_url"], cred=CRED_N8N)
+    st.session_state.msg_panel = ("success" if ok else "error", msg)
 
 
 def limpiar_sesion():
@@ -322,14 +384,19 @@ with st.sidebar:
     st.markdown("### 🚀 CommunityLab")
     st.caption("Motor inteligente de transformación y distribución · Hackathon ONE G10")
 
-    st.info("**Modo demostración.** El análisis usa heurísticas y plantillas, sin API key ni nube. "
-            "El motor con Gemini y OCI vive en el repo [desafio](https://github.com/DiegoTCobba/desafio).")
-
     cfg = st.session_state.config
+    if cfg["motor"] == "n8n":
+        st.success("**Conectado a n8n.** El análisis, el ruteo y la generación los hace el workflow.")
+    else:
+        st.info("**Modo demostración.** El análisis usa heurísticas y plantillas, sin conexión. "
+                "Conecta tu workflow de n8n en el **Panel de control**.")
+
     st.subheader("⚙️ Configuración activa")
-    st.markdown(f"- Caso de éxito si sentimiento ≥ **{cfg['umbral_exito']:+.2f}**\n"
-                f"- Alerta si sentimiento ≤ **{cfg['umbral_alerta']:+.2f}**\n"
-                f"- Hasta **{cfg['max_por_ruta']}** mensajes por ruta\n"
+    pedidos = [n for k, n in (("generar_linkedin", "LinkedIn"), ("generar_newsletter", "Newsletter"),
+                               ("generar_faq", "FAQ")) if cfg[k]]
+    st.markdown(f"- Motor: **{MOTORES[cfg['motor']]}**\n"
+                f"- Genera: **{', '.join(pedidos) or 'nada'}**\n"
+                f"- Idioma y tono: **{IDIOMAS[cfg['idioma']]}**, **{cfg['tono']}**\n"
                 f"- Equipo de soporte: **{len(cfg['equipo'])}**")
     st.caption("Cámbiala en la pestaña **⚙️ Panel de control**.")
     abiertos = sum(t["estado"] != "Resuelto" for t in st.session_state.tickets)
@@ -408,14 +475,10 @@ with tab_in:
     if procesar:
         payload = {"origen_comunidad": st.session_state.origen, "periodo_referencia": st.session_state.periodo,
                    "interacciones": editado.to_dict("records")}
-        try:
-            motor = crear_motor()
-        except Exception as e:  # noqa: BLE001
-            st.error(f"No se pudo iniciar el motor: {e}")
-            st.stop()
-        with st.status("Procesando lote…", expanded=True) as estado:
+        destino = "n8n" if st.session_state.config["motor"] == "n8n" else "el motor de demostración"
+        with st.status(f"Procesando lote con {destino}…", expanded=True) as estado:
             try:
-                resultado = motor.procesar(payload, progreso=estado.write)
+                resultado, payload = ejecutar(payload, progreso=estado.write)
             except Exception as e:  # noqa: BLE001
                 estado.update(label="Error al procesar", state="error")
                 st.error(str(e))
@@ -440,67 +503,80 @@ with tab_salud:
         m1, m2, m3, m4 = st.columns([1, 1.8, 1, 1])
         m1.metric("Interacciones", r["total_interacciones_procesadas"])
         m2.metric("Sentimiento predominante", r["sentimiento_predominante"])
-        m3.metric("Puntaje promedio", f"{r['puntaje_sentimiento_promedio']:+.2f}", help="-1 muy negativo · +1 muy positivo")
+        prom = r["puntaje_sentimiento_promedio"]
+        m3.metric("Puntaje promedio", "—" if prom is None else f"{prom:+.2f}", help="-1 muy negativo · +1 muy positivo")
         m4.metric("Alertas de apoyo", len(r["alertas_apoyo"]))
         if r.get("lectura_salud"):
             st.info(f"🩺 {r['lectura_salud']}")
 
-        df_an = pd.DataFrame(res["analisis"])
-        df_an["ruta_lbl"] = df_an["ruta"].map(pl.RUTAS)
-        df_an["categoria_lbl"] = df_an["categoria"].map(pl.CATEGORIAS)
-        df_an["temas_txt"] = df_an["temas"].apply(", ".join)
+        if not res["analisis"]:
+            st.info("n8n devolvió solo el resumen del lote, sin el análisis por interacción. Para ver la distribución "
+                    "de sentimiento, el mapa de momentos y el ranking, haz que el workflow incluya `analisis` en la "
+                    "respuesta (ver README).")
+            if r["frecuencia_temas"]:
+                st.markdown("##### Temas principales")
+                dt = pd.DataFrame([{"tema": k, "n": v} for k, v in r["frecuencia_temas"].items()])
+                st.altair_chart(alt.Chart(dt).mark_bar(cornerRadiusEnd=4, color="#7a2a8c").encode(
+                    x=alt.X("n:Q", title="Menciones", axis=alt.Axis(tickMinStep=1)),
+                    y=alt.Y("tema:N", sort="-x", title=None, axis=alt.Axis(labelLimit=200)),
+                    tooltip=["tema", "n"]).properties(height=max(160, 40 * len(dt))), width="stretch")
+        else:
+            df_an = pd.DataFrame(res["analisis"])
+            df_an["ruta_lbl"] = df_an["ruta"].map(pl.RUTAS)
+            df_an["categoria_lbl"] = df_an["categoria"].map(pl.CATEGORIAS)
+            df_an["temas_txt"] = df_an["temas"].apply(", ".join)
 
-        g1, g2 = st.columns(2, gap="large")
-        with g1:
-            st.markdown("##### Distribución de sentimiento")
-            ds = pd.DataFrame([{"sentimiento": k, "n": v} for k, v in r["distribucion_sentimiento"].items()])
-            st.altair_chart(alt.Chart(ds).mark_bar(cornerRadiusEnd=4).encode(
-                x=alt.X("n:Q", title="Interacciones", axis=alt.Axis(tickMinStep=1)),
-                y=alt.Y("sentimiento:N", sort=pl.ORDEN_SENTIMIENTO, title=None, axis=alt.Axis(labelLimit=200)),
-                color=alt.Color("sentimiento:N", scale=alt.Scale(domain=list(COLOR_SENT), range=list(COLOR_SENT.values())),
-                                legend=None),
-                tooltip=["sentimiento", "n"]).properties(height=220), width="stretch")
-        with g2:
-            st.markdown("##### Temas en tendencia")
-            dt = pd.DataFrame([{"tema": k, "n": v} for k, v in r["frecuencia_temas"].items()])
-            st.altair_chart(alt.Chart(dt).mark_bar(cornerRadiusEnd=4, color="#7a2a8c").encode(
-                x=alt.X("n:Q", title="Menciones", axis=alt.Axis(tickMinStep=1)),
-                y=alt.Y("tema:N", sort="-x", title=None, axis=alt.Axis(labelLimit=200)),
-                tooltip=["tema", "n"]).properties(height=max(220, 28 * len(dt))),
-                width="stretch")
+            g1, g2 = st.columns(2, gap="large")
+            with g1:
+                st.markdown("##### Distribución de sentimiento")
+                ds = pd.DataFrame([{"sentimiento": k, "n": v} for k, v in r["distribucion_sentimiento"].items()])
+                st.altair_chart(alt.Chart(ds).mark_bar(cornerRadiusEnd=4).encode(
+                    x=alt.X("n:Q", title="Interacciones", axis=alt.Axis(tickMinStep=1)),
+                    y=alt.Y("sentimiento:N", sort=pl.ORDEN_SENTIMIENTO, title=None, axis=alt.Axis(labelLimit=200)),
+                    color=alt.Color("sentimiento:N", scale=alt.Scale(domain=list(COLOR_SENT), range=list(COLOR_SENT.values())),
+                                    legend=None),
+                    tooltip=["sentimiento", "n"]).properties(height=220), width="stretch")
+            with g2:
+                st.markdown("##### Temas en tendencia")
+                dt = pd.DataFrame([{"tema": k, "n": v} for k, v in r["frecuencia_temas"].items()])
+                st.altair_chart(alt.Chart(dt).mark_bar(cornerRadiusEnd=4, color="#7a2a8c").encode(
+                    x=alt.X("n:Q", title="Menciones", axis=alt.Axis(tickMinStep=1)),
+                    y=alt.Y("tema:N", sort="-x", title=None, axis=alt.Axis(labelLimit=200)),
+                    tooltip=["tema", "n"]).properties(height=max(220, 28 * len(dt))),
+                    width="stretch")
 
-        g3, g4 = st.columns([3, 2], gap="large")
-        with g3:
-            st.markdown("##### Mapa de momentos (sentimiento × relevancia)")
-            st.altair_chart(alt.Chart(df_an).mark_circle(size=220, opacity=.85).encode(
-                x=alt.X("sentimiento_puntaje:Q", title="Sentimiento", scale=alt.Scale(domain=[-1, 1])),
-                y=alt.Y("puntaje_relevancia:Q", title="Relevancia", scale=alt.Scale(domain=[0, 100])),
-                color=alt.Color("ruta_lbl:N", title="Ruta"),
-                tooltip=["autor", "canal", "ruta_lbl", "puntaje_relevancia", "sentimiento", "texto"]
-            ).properties(height=280), width="stretch")
-        with g4:
-            st.markdown("##### Ruteo del flujo")
-            dr = pd.DataFrame([{"ruta": k, "n": v} for k, v in r["distribucion_rutas"].items()])
-            st.altair_chart(alt.Chart(dr).mark_arc(innerRadius=55).encode(
-                theta="n:Q", color=alt.Color("ruta:N", title=None, legend=alt.Legend(orient="bottom", columns=2)),
-                tooltip=["ruta", "n"]).properties(height=280), width="stretch")
+            g3, g4 = st.columns([3, 2], gap="large")
+            with g3:
+                st.markdown("##### Mapa de momentos (sentimiento × relevancia)")
+                st.altair_chart(alt.Chart(df_an).mark_circle(size=220, opacity=.85).encode(
+                    x=alt.X("sentimiento_puntaje:Q", title="Sentimiento", scale=alt.Scale(domain=[-1, 1])),
+                    y=alt.Y("puntaje_relevancia:Q", title="Relevancia", scale=alt.Scale(domain=[0, 100])),
+                    color=alt.Color("ruta_lbl:N", title="Ruta"),
+                    tooltip=["autor", "canal", "ruta_lbl", "puntaje_relevancia", "sentimiento", "texto"]
+                ).properties(height=280), width="stretch")
+            with g4:
+                st.markdown("##### Ruteo del flujo")
+                dr = pd.DataFrame([{"ruta": k, "n": v} for k, v in r["distribucion_rutas"].items()])
+                st.altair_chart(alt.Chart(dr).mark_arc(innerRadius=55).encode(
+                    theta="n:Q", color=alt.Color("ruta:N", title=None, legend=alt.Legend(orient="bottom", columns=2)),
+                    tooltip=["ruta", "n"]).properties(height=280), width="stretch")
 
-        st.markdown("##### Ranking de interacciones")
-        st.dataframe(
-            df_an[["puntaje_relevancia", "autor", "canal", "categoria_lbl", "sentimiento", "sentimiento_puntaje",
-                   "ruta_lbl", "temas_txt", "cita_destacada", "justificacion"]],
-            hide_index=True, width="stretch",
-            column_config={
-                "puntaje_relevancia": st.column_config.ProgressColumn("Relevancia", min_value=0, max_value=100, format="%d"),
-                "autor": "Autor", "canal": "Canal", "categoria_lbl": "Categoría", "sentimiento": "Sentimiento",
-                "sentimiento_puntaje": st.column_config.NumberColumn("Puntaje", format="%+.2f"),
-                "ruta_lbl": "Ruta", "temas_txt": "Temas", "cita_destacada": "Cita destacada",
-                "justificacion": "Justificación"})
+            st.markdown("##### Ranking de interacciones")
+            st.dataframe(
+                df_an[["puntaje_relevancia", "autor", "canal", "categoria_lbl", "sentimiento", "sentimiento_puntaje",
+                       "ruta_lbl", "temas_txt", "cita_destacada", "justificacion"]],
+                hide_index=True, width="stretch",
+                column_config={
+                    "puntaje_relevancia": st.column_config.ProgressColumn("Relevancia", min_value=0, max_value=100, format="%d"),
+                    "autor": "Autor", "canal": "Canal", "categoria_lbl": "Categoría", "sentimiento": "Sentimiento",
+                    "sentimiento_puntaje": st.column_config.NumberColumn("Puntaje", format="%+.2f"),
+                    "ruta_lbl": "Ruta", "temas_txt": "Temas", "cita_destacada": "Cita destacada",
+                    "justificacion": "Justificación"})
 
-        if r["alertas_apoyo"]:
-            st.markdown("##### 🆘 Miembros que necesitan apoyo")
-            for al in r["alertas_apoyo"]:
-                st.error(f"**{al['autor']}** en `{al['canal']}` · {al['sentimiento']}\n\n> {al['texto']}")
+            if r["alertas_apoyo"]:
+                st.markdown("##### 🆘 Miembros que necesitan apoyo")
+                for al in r["alertas_apoyo"]:
+                    st.error(f"**{al['autor']}** en `{al['canal']}` · {al['sentimiento']}\n\n> {al['texto']}")
 
 # ============================================================ 3 · curaduría
 with tab_cur:
@@ -585,16 +661,30 @@ with tab_tk:
             getattr(st, nivel)(texto)
             st.session_state.msg_ticket = None
 
+        resueltos = [t for t in tickets if t["estado"] == "Resuelto"]
+        bandeja = st.radio("Bandeja", ["Abiertos", "Resueltos", "Todos"], horizontal=True, key="bandeja_tickets",
+                           captions=[f"{len(abiertos)} ticket(s)", f"{len(resueltos)} ticket(s)", f"{len(tickets)} ticket(s)"])
         f1, f2, f3 = st.columns(3)
-        est_sel = f1.multiselect("Estado", pl.ESTADOS_TICKET, default=["Pendiente", "En progreso", "Escalado"],
-                                 format_func=ICONO_TICKET.get)
+        if bandeja == "Abiertos":
+            est_sel = f1.multiselect("Estado", ["Pendiente", "En progreso", "Escalado"],
+                                     default=["Pendiente", "En progreso", "Escalado"], format_func=ICONO_TICKET.get)
+        else:
+            est_sel = ["Resuelto"] if bandeja == "Resueltos" else pl.ESTADOS_TICKET
         pri_sel = f2.multiselect("Prioridad", pl.PRIORIDADES, default=pl.PRIORIDADES, format_func=ICONO_PRIORIDAD.get)
         resp_sel = f3.selectbox("Responsable", ["Todos", SIN_ASIGNAR] + cfg["equipo"])
         visibles = [t for t in tickets if t["estado"] in est_sel and t["prioridad"] in pri_sel
                     and (resp_sel == "Todos" or (t["asignado_a"] or SIN_ASIGNAR) == resp_sel)]
 
+        if bandeja == "Resueltos" and resueltos:
+            horas = [pl.horas_resolucion(t) for t in resueltos]
+            en_sla = sum(bool(pl.dentro_de_sla(t)) for t in resueltos)
+            st.caption(f"Tiempo medio de resolución: **{sum(horas) / len(horas):.1f} h** · "
+                       f"**{en_sla} de {len(resueltos)}** dentro del SLA")
+
         if not tickets:
             st.success("No hay tickets: el bot pudo atender todas las consultas de este lote.")
+        elif bandeja == "Resueltos" and not resueltos:
+            st.info("Aún no hay tickets resueltos. Cuando resuelvas uno, aparecerá aquí con su respuesta.")
         elif not visibles:
             st.info("Ningún ticket coincide con los filtros.")
 
@@ -616,14 +706,20 @@ with tab_tk:
                 st.caption(f"Motivo: {t['motivo']}" + (f" · Temas: {', '.join(t['temas'])}" if t["temas"] else ""))
 
                 resuelto = t["estado"] == "Resuelto"
-                c1, c2 = st.columns(2)
-                c1.selectbox("Responsable", opciones_resp, key=f"tk_asig_{tid}", disabled=resuelto)
-                c2.selectbox("Estado", pl.ESTADOS_TICKET, key=f"tk_est_{tid}", format_func=ICONO_TICKET.get,
-                             disabled=resuelto)
-                st.text_area("Respuesta al miembro", key=f"tk_resp_{tid}", height=100, disabled=resuelto,
-                             placeholder="Escribe la respuesta o la acción tomada…")
-                if t["activo_id"] and not resuelto:
-                    st.checkbox("Usar esta respuesta en el borrador del FAQ", value=True, key=f"tk_faq_{tid}")
+                if resuelto:
+                    st.success(f"**Respuesta** ({t['asignado_a'] or 'sin responsable'}): {t['respuesta']}")
+                    sla_ok = pl.dentro_de_sla(t)
+                    st.caption(f"Resuelto el {datetime.fromisoformat(t['resuelto_en']):%d/%m %H:%M} · "
+                               f"en {pl.horas_resolucion(t)} h · "
+                               + ("✅ dentro del SLA" if sla_ok else "⚠️ fuera del SLA"))
+                else:
+                    c1, c2 = st.columns(2)
+                    c1.selectbox("Responsable", opciones_resp, key=f"tk_asig_{tid}")
+                    c2.selectbox("Estado", pl.ESTADOS_TICKET, key=f"tk_est_{tid}", format_func=ICONO_TICKET.get)
+                    st.text_area("Respuesta al miembro", key=f"tk_resp_{tid}", height=100,
+                                 placeholder="Escribe la respuesta o la acción tomada…")
+                    if t["activo_id"]:
+                        st.checkbox("Usar esta respuesta en el borrador del FAQ", value=True, key=f"tk_faq_{tid}")
 
                 b1, b2, b3, b4 = st.columns([1, 1, 1, 2])
                 if resuelto:
@@ -681,9 +777,14 @@ with tab_pkg:
                                "text/markdown", width="stretch")
         with p2:
             destino = almacen_activo()
-            st.markdown("##### Guardar")
-            st.info(f"Se guarda en `salida_local/{destino.bucket}/` con la misma estructura de carpetas "
-                    "que el bucket de OCI del motor completo.")
+            oci = res.get("almacenamiento_oci") or {}
+            if oci:
+                (st.success if oci.get("status") == "guardado_con_exito" else st.warning)(
+                    f"**n8n ya guardó el paquete del lote en OCI** ({oci.get('status', '—')}): "
+                    f"`{oci.get('bucket', '')}/{oci.get('ruta_objeto', '')}`")
+            st.markdown("##### Guardar la versión curada")
+            st.info(f"Guarda lo aprobado en `salida_local/{destino.bucket}/` con la misma estructura de carpetas "
+                    "que el bucket de OCI.")
             if n_pkg == 0:
                 st.caption("Aprueba al menos un activo en **Curaduría** (o incluye los pendientes).")
             if st.button("💾 Guardar paquete", type="primary", disabled=n_pkg == 0, width="stretch"):
@@ -716,32 +817,37 @@ with tab_cfg:
     cfg = st.session_state.config
     v = st.session_state.cfg_ver
     st.markdown("#### ⚙️ Panel de control")
-    st.caption("Ajusta cómo el sistema clasifica, redacta y deriva consultas. "
-               "Los cambios se aplican en el próximo procesamiento o al reprocesar el lote actual.")
+    st.caption("La inteligencia vive en el workflow de n8n: análisis, ruteo, generación y guardado en OCI. "
+               "Aquí se configura cómo la interfaz se conecta con él, qué le pide y cómo el equipo atiende los tickets.")
     if st.session_state.msg_panel:
         nivel, texto = st.session_state.msg_panel
         getattr(st, nivel)(texto)
         st.session_state.msg_panel = None
 
     with st.form("form_config"):
-        st.markdown("##### 🔀 Reglas de ruteo")
-        r1, r2, r3 = st.columns(3)
-        r1.slider("Sentimiento mínimo para caso de éxito", 0.0, 1.0, float(cfg["umbral_exito"]), 0.05,
-                  key=f"cfg_umbral_exito_{v}")
-        r2.slider("Sentimiento máximo para alerta de apoyo", -1.0, 0.0, float(cfg["umbral_alerta"]), 0.05,
-                  key=f"cfg_umbral_alerta_{v}", help="Mensajes con sentimiento igual o menor generan una alerta.")
-        r3.number_input("Máx. mensajes a transformar por ruta", 1, 20, int(cfg["max_por_ruta"]),
-                        key=f"cfg_max_por_ruta_{v}")
-        st.text_input("Palabras que disparan una alerta (separadas por coma)", ", ".join(cfg["palabras_alerta"]),
-                      key=f"cfg_palabras_alerta_{v}")
+        st.markdown("##### 🔌 Conexión con n8n")
+        st.radio("Motor de procesamiento", list(MOTORES), index=list(MOTORES).index(cfg["motor"]),
+                 format_func=MOTORES.get, horizontal=True, key=f"cfg_motor_{v}")
+        n1, n2 = st.columns([4, 1])
+        n1.text_input("URL del webhook", cfg["n8n_url"], key=f"cfg_n8n_url_{v}",
+                      placeholder="https://tu-n8n/webhook/communitylab/actividades")
+        n2.number_input("Tiempo de espera (s)", 10, 600, int(cfg["n8n_timeout"]), key=f"cfg_n8n_timeout_{v}")
+        st.caption("🔑 Autenticación del webhook: " + (
+            f"cabecera `{CRED_N8N['header_name']}` configurada en secrets." if CRED_N8N["header_name"]
+            else "ninguna. Si tu webhook la exige, agrégala en `.streamlit/secrets.toml` → `[n8n]`."))
 
-        st.markdown("##### ✍️ Voz y publicaciones")
-        st.text_area("Voz de marca", cfg["voz"], height=120, key=f"cfg_voz_{v}")
-        p1, p2 = st.columns([3, 1])
-        p1.text_input("Hashtags fijos", " ".join(cfg["hashtags_base"]), key=f"cfg_hashtags_base_{v}")
-        p2.number_input("Límite de caracteres en X", 100, 4000, int(cfg["limite_x"]), key=f"cfg_limite_x_{v}")
+        st.markdown("##### 📨 Qué se le pide a n8n")
+        st.caption("Viaja en `opciones` del request. El workflow decide con ellas qué ramas ejecutar.")
+        o1, o2, o3 = st.columns(3)
+        o1.checkbox("Generar posts de LinkedIn y X", cfg["generar_linkedin"], key=f"cfg_generar_linkedin_{v}")
+        o2.checkbox("Generar destaque de newsletter", cfg["generar_newsletter"], key=f"cfg_generar_newsletter_{v}")
+        o3.checkbox("Generar Tips / FAQ", cfg["generar_faq"], key=f"cfg_generar_faq_{v}")
+        o4, o5 = st.columns(2)
+        o4.selectbox("Idioma", list(IDIOMAS), index=list(IDIOMAS).index(cfg["idioma"]), format_func=IDIOMAS.get,
+                     key=f"cfg_idioma_{v}")
+        o5.selectbox("Tono", TONOS, index=TONOS.index(cfg["tono"]), key=f"cfg_tono_{v}")
 
-        st.markdown("##### 🎫 Tickets")
+        st.markdown("##### 🎫 Atención de tickets")
         t1, t2 = st.columns([2, 3])
         t1.text_area("Equipo de soporte (uno por línea)", "\n".join(cfg["equipo"]), height=130, key=f"cfg_equipo_{v}")
         with t2:
@@ -754,15 +860,33 @@ with tab_cfg:
                         key=f"cfg_tk_derivadas_{v}")
             st.checkbox("Crear tickets para dudas que superan el máximo por ruta", cfg["tickets_excedentes"],
                         key=f"cfg_tk_excedentes_{v}")
+        st.number_input("Límite de caracteres para X en Curaduría", 100, 4000, int(cfg["limite_x"]),
+                        key=f"cfg_limite_x_{v}")
+
+        with st.expander("🧪 Reglas del motor de demostración (solo cuando no se usa n8n)"):
+            st.caption("Con n8n, estas reglas viven en el workflow y aquí no tienen efecto.")
+            r1, r2, r3 = st.columns(3)
+            r1.slider("Sentimiento mínimo para caso de éxito", 0.0, 1.0, float(cfg["umbral_exito"]), 0.05,
+                      key=f"cfg_umbral_exito_{v}")
+            r2.slider("Sentimiento máximo para alerta de apoyo", -1.0, 0.0, float(cfg["umbral_alerta"]), 0.05,
+                      key=f"cfg_umbral_alerta_{v}")
+            r3.number_input("Máx. mensajes a transformar por ruta", 1, 20, int(cfg["max_por_ruta"]),
+                            key=f"cfg_max_por_ruta_{v}")
+            st.text_input("Palabras que disparan una alerta (separadas por coma)", ", ".join(cfg["palabras_alerta"]),
+                          key=f"cfg_palabras_alerta_{v}")
+            st.text_area("Voz de marca", cfg["voz"], height=100, key=f"cfg_voz_{v}")
+            st.text_input("Hashtags fijos", " ".join(cfg["hashtags_base"]), key=f"cfg_hashtags_base_{v}")
 
         st.form_submit_button("💾 Guardar configuración", type="primary", on_click=guardar_config)
 
-    a1, a2, a3 = st.columns(3)
-    a1.button("🔁 Reprocesar el lote actual", on_click=reprocesar, disabled=not st.session_state.ultimo_payload,
-              width="stretch", help="Vuelve a analizar el último lote con la configuración guardada. "
+    a1, a2, a3, a4 = st.columns(4)
+    a1.button("📡 Probar conexión con n8n", on_click=probar_n8n, disabled=not cfg["n8n_url"], width="stretch",
+              help="Hace una petición GET a la URL; no crea ningún lote.")
+    a2.button("🔁 Reprocesar el lote actual", on_click=reprocesar, disabled=not st.session_state.ultimo_payload,
+              width="stretch", help="Vuelve a enviar el último lote con la configuración guardada. "
                                     "Se pierden las aprobaciones y los tickets de esa corrida.")
-    a2.button("↺ Restablecer valores por defecto", on_click=restablecer_config, width="stretch")
-    a3.download_button("⬇️ Exportar configuración", json.dumps(cfg, ensure_ascii=False, indent=2),
+    a3.button("↺ Valores por defecto", on_click=restablecer_config, width="stretch")
+    a4.download_button("⬇️ Exportar configuración", json.dumps(cfg, ensure_ascii=False, indent=2),
                        "communitylab-config.json", "application/json", width="stretch")
     with st.expander("⬆️ Importar configuración"):
         archivo_cfg = st.file_uploader("Archivo JSON exportado desde este panel", type=["json"], key=f"cfg_file_{v}")
@@ -770,16 +894,23 @@ with tab_cfg:
 
     st.markdown("##### 🩺 Estado del sistema")
     guardados = almacen_activo().listar()
+    motor_res = (res or {}).get("motor", {})
+    oci = (res or {}).get("almacenamiento_oci") or {}
     estado = pd.DataFrame([
-        {"Componente": "Motor", "Estado": "🟢 Demostración (heurísticas y plantillas)"},
+        {"Componente": "Motor", "Estado": (f"🟢 n8n · {cfg['n8n_url']}" if cfg["motor"] == "n8n"
+                                           else "🟡 Demostración local (heurísticas y plantillas)")},
         {"Componente": "Último procesamiento", "Estado": res["generado_en"].replace("T", " ") if res else "—"},
+        {"Componente": "Lote en n8n (id / estado)",
+         "Estado": f"{motor_res.get('id_lote', '—')} / {motor_res.get('estado_lote', '—')}" if motor_res.get("modo") == "n8n" else "—"},
+        {"Componente": "Paquete en OCI (por n8n)",
+         "Estado": f"{oci.get('status', '—')} · {oci.get('bucket', '')}/{oci.get('ruta_objeto', '')}" if oci else "—"},
         {"Componente": "Interacciones del último lote",
          "Estado": str(res["resumen"]["total_interacciones_procesadas"]) if res else "—"},
         {"Componente": "Activos generados / aprobados",
          "Estado": f"{len(activos)} / {sum(a['estado'] == 'aprobado' for a in activos)}" if res else "—"},
         {"Componente": "Tickets abiertos / total",
          "Estado": f"{sum(t['estado'] != 'Resuelto' for t in tickets)} / {len(tickets)}" if res else "—"},
-        {"Componente": "Archivos guardados", "Estado": f"{len(guardados)} en salida_local/"},
+        {"Componente": "Archivos guardados localmente", "Estado": f"{len(guardados)} en salida_local/"},
     ])
     st.dataframe(estado, hide_index=True, width="stretch")
     st.button("🧹 Limpiar sesión", on_click=limpiar_sesion,
